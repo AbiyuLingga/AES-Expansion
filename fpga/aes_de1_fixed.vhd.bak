@@ -1,0 +1,202 @@
+-- DE1 Cyclone II | two-way RS232 AES-128 Key Expansion demonstration.
+-- Python -> FPGA: K<32 hex digits>\n
+-- FPGA -> Python: K00:<32 hex>\r\n ... K10:<32 hex>\r\n
+-- 11 round keys are also retained for seven-segment display on DE1.
+-- Unmasked, educational design: DO NOT TRANSMIT PRODUCTION SECRET KEYS.
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+entity aes_de1_fixed is
+  generic (BAUD_RATE : positive := 115200);
+  port (
+    CLOCK_50 : in std_logic;
+    KEY0, KEY1 : in std_logic;
+    SW0,SW1,SW2,SW3,SW4,SW5,SW6,SW7 : in std_logic;
+    UART_RXD : in std_logic;
+    UART_TXD : out std_logic;
+    LEDG0,LEDG1,LEDG2,LEDG3 : out std_logic;
+    HEX0_A,HEX0_B,HEX0_C,HEX0_D,HEX0_E,HEX0_F,HEX0_G : out std_logic;
+    HEX1_A,HEX1_B,HEX1_C,HEX1_D,HEX1_E,HEX1_F,HEX1_G : out std_logic;
+    HEX2_A,HEX2_B,HEX2_C,HEX2_D,HEX2_E,HEX2_F,HEX2_G : out std_logic;
+    HEX3_A,HEX3_B,HEX3_C,HEX3_D,HEX3_E,HEX3_F,HEX3_G : out std_logic
+  );
+end entity;
+architecture rtl of aes_de1_fixed is
+  type bank_t is array(0 to 10) of std_logic_vector(127 downto 0);
+  type phase_t is (WAIT_KEY, START_CORE, CAPTURE_KEYS, TRIGGER_DUMP, WAIT_DUMP_BUSY, DUMPING);
+  signal phase : phase_t := WAIT_KEY;
+  signal bank : bank_t := (others=>(others=>'0'));
+  signal ready : std_logic := '0';
+  signal have_key : std_logic := '0';
+  signal active_key : std_logic_vector(127 downto 0) := x"2B7E151628AED2A6ABF7158809CF4F3C";
+  signal key0_s1,key0_s2,key1_s1,key1_s2,key1_old : std_logic := '1';
+  signal sw_s1,sw_s2 : std_logic_vector(7 downto 0) := (others=>'0');
+  signal reset_core, start_pulse : std_logic;
+  signal rx_byte : std_logic_vector(7 downto 0);
+  signal rx_valid : std_logic;
+  signal parsed_key : std_logic_vector(127 downto 0);
+  signal parsed_valid : std_logic;
+  signal core_key : std_logic_vector(127 downto 0);
+  signal core_round : std_logic_vector(3 downto 0);
+  signal core_valid,core_done,core_busy : std_logic;
+  signal dump_busy,dump_start : std_logic;
+  signal dump_round : std_logic_vector(3 downto 0);
+  signal dump_key : std_logic_vector(127 downto 0);
+  signal selected : std_logic_vector(15 downto 0) := (others=>'0');
+  signal hex_valid : std_logic := '0';
+  signal seg0,seg1,seg2,seg3 : std_logic_vector(6 downto 0);
+  signal heartbeat : unsigned(24 downto 0) := (others=>'0');
+  -- Diagnostics: sticky flags until KEY0. LED1: RX start edge; LED2: decoded byte;
+  -- LED3: complete valid master key; LED0: AES finished.
+  signal rx_input_s1, rx_input_s2, rx_input_old : std_logic := '1';
+  signal rx_start_seen, rx_byte_seen : std_logic := '0';
+  function seg7(x: std_logic_vector(3 downto 0)) return std_logic_vector is
+  begin
+    case x is
+      when x"0" => return "1000000";
+      when x"1" => return "1111001";
+      when x"2" => return "0100100";
+      when x"3" => return "0110000";
+      when x"4" => return "0011001";
+      when x"5" => return "0010010";
+      when x"6" => return "0000010";
+      when x"7" => return "1111000";
+      when x"8" => return "0000000";
+      when x"9" => return "0010000";
+      when x"A" => return "0001000";
+      when x"B" => return "0000011";
+      when x"C" => return "1000110";
+      when x"D" => return "0100001";
+      when x"E" => return "0000110";
+      when x"F" => return "0001110";
+      when others => return "1111111";
+    end case;
+  end function;
+begin
+  -- Synchronize user controls to 50MHz system clock.
+  process(CLOCK_50)
+  begin
+    if rising_edge(CLOCK_50) then
+      key0_s1<=KEY0; key0_s2<=key0_s1;
+      key1_s1<=KEY1; key1_s2<=key1_s1; key1_old<=key1_s2;
+      sw_s1<=SW7 & SW6 & SW5 & SW4 & SW3 & SW2 & SW1 & SW0;
+      sw_s2<=sw_s1;
+      heartbeat<=heartbeat+1;
+      rx_input_s1 <= UART_RXD;
+      rx_input_s2 <= rx_input_s1;
+      rx_input_old <= rx_input_s2;
+      if reset_core='1' then
+        rx_start_seen <= '0';
+        rx_byte_seen <= '0';
+      else
+        if rx_input_old='1' and rx_input_s2='0' then rx_start_seen <= '1'; end if;
+        if rx_valid='1' then rx_byte_seen <= '1'; end if;
+      end if;
+    end if;
+  end process;
+  reset_core <= not key0_s2;
+  start_pulse <= '1' when phase=START_CORE else '0';
+  dump_start <= '1' when phase=TRIGGER_DUMP else '0';
+
+  u_rx : entity work.uart_rx_8n1
+    generic map(CLOCK_HZ=>50000000, BAUD_RATE=>BAUD_RATE)
+    port map(clk=>CLOCK_50,rst=>reset_core,rx=>UART_RXD,
+             data_out=>rx_byte,data_valid=>rx_valid);
+  u_parse : entity work.uart_key_parser
+    port map(clk=>CLOCK_50,rst=>reset_core,byte_in=>rx_byte,
+             byte_valid=>rx_valid,key_value=>parsed_key,key_valid=>parsed_valid);
+  u_aes : entity work.aes128_keyexp
+    port map(clk=>CLOCK_50,rst=>reset_core,start=>start_pulse,key_in=>active_key,
+             round_key=>core_key,round_index=>core_round,
+             valid=>core_valid,done=>core_done,busy=>core_busy);
+  dump_key <= bank(to_integer(unsigned(dump_round)))
+    when to_integer(unsigned(dump_round))<=10 else (others=>'0');
+  u_uart_dump : entity work.aes_uart_dump
+    generic map(CLOCK_HZ=>50000000,BAUD_RATE=>BAUD_RATE)
+    port map(clk=>CLOCK_50,rst=>reset_core,start_dump=>dump_start,
+             round_sel=>dump_round,key_data=>dump_key,dump_busy=>dump_busy,
+             uart_txd=>UART_TXD);
+
+  -- Only accept a new serial command when no AES job / dump is in progress.
+  -- KEY1 reruns last received key. If none received, tests public key.
+  process(CLOCK_50)
+  begin
+    if rising_edge(CLOCK_50) then
+      if reset_core='1' then
+        phase<=WAIT_KEY;
+        bank<=(others=>(others=>'0'));
+        ready<='0';
+        have_key<='0';
+        active_key<=x"2B7E151628AED2A6ABF7158809CF4F3C";
+      else
+        case phase is
+          when WAIT_KEY =>
+            if parsed_valid='1' then
+              active_key<=parsed_key;
+              have_key<='1';
+              bank<=(others=>(others=>'0'));
+              ready<='0';
+              phase<=START_CORE;
+            elsif key1_old='1' and key1_s2='0' then
+              if have_key='0' then
+                if sw_s2(7)='1' then
+                  active_key<=x"000102030405060708090A0B0C0D0E0F";
+                else
+                  active_key<=x"2B7E151628AED2A6ABF7158809CF4F3C";
+                end if;
+              end if;
+              ready<='0';
+              bank<=(others=>(others=>'0'));
+              phase<=START_CORE;
+            end if;
+          when START_CORE =>
+            phase<=CAPTURE_KEYS;
+          when CAPTURE_KEYS =>
+            if core_valid='1' then
+              bank(to_integer(unsigned(core_round)))<=core_key;
+            end if;
+            if core_done='1' then
+              ready<='1';
+              phase<=TRIGGER_DUMP;
+            end if;
+          when TRIGGER_DUMP =>
+            phase<=WAIT_DUMP_BUSY;
+          when WAIT_DUMP_BUSY =>
+            if dump_busy='1' then phase<=DUMPING; end if;
+          when DUMPING =>
+            if dump_busy='0' then phase<=WAIT_KEY; end if;
+        end case;
+      end if;
+    end if;
+  end process;
+
+  -- Display identical to original: SW6..3 round, SW2..0 page.
+  process(bank,sw_s2,ready)
+    variable nr,pg:integer;
+  begin
+    selected<=(others=>'0');
+    hex_valid<='0';
+    nr:=to_integer(unsigned(sw_s2(6 downto 3)));
+    pg:=to_integer(unsigned(sw_s2(2 downto 0)));
+    if ready='1' and nr<=10 then
+      selected<=bank(nr)(127-16*pg downto 112-16*pg);
+      hex_valid<='1';
+    end if;
+  end process;
+  seg0<=seg7(selected(3 downto 0)) when hex_valid='1' else seg7(x"8");
+  seg1<=seg7(selected(7 downto 4)) when hex_valid='1' else seg7(x"2");
+  seg2<=seg7(selected(11 downto 8)) when hex_valid='1' else seg7(x"1");
+  seg3<=seg7(selected(15 downto 12)) when hex_valid='1' else seg7(x"F");
+  LEDG0<=ready;
+  LEDG1<=rx_start_seen;
+  LEDG2<=rx_byte_seen;
+  LEDG3<=have_key;
+  HEX0_A<=seg0(0); HEX0_B<=seg0(1); HEX0_C<=seg0(2);
+  HEX0_D<=seg0(3); HEX0_E<=seg0(4); HEX0_F<=seg0(5); HEX0_G<=seg0(6);
+  HEX1_A<=seg1(0); HEX1_B<=seg1(1); HEX1_C<=seg1(2);
+  HEX1_D<=seg1(3); HEX1_E<=seg1(4); HEX1_F<=seg1(5); HEX1_G<=seg1(6);
+  HEX2_A<=seg2(0); HEX2_B<=seg2(1); HEX2_C<=seg2(2);
+  HEX2_D<=seg2(3); HEX2_E<=seg2(4); HEX2_F<=seg2(5); HEX2_G<=seg2(6);
+  HEX3_A<=seg3(0); HEX3_B<=seg3(1); HEX3_C<=seg3(2);
+  HEX3_D<=seg3(3); HEX3_E<=seg3(4); HEX3_F<=seg3(5); HEX3_G<=seg3(6);
+end architecture rtl;
